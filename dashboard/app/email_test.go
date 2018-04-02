@@ -26,35 +26,43 @@ func TestEmailReport(t *testing.T) {
 	c.expectOK(c.API(client2, key2, "report_crash", crash, nil))
 
 	// Report the crash over email and check all fields.
-	sender0 := ""
+	var sender0, extBugID0, body0 string
 	{
 		c.expectOK(c.GET("/email_poll"))
 		c.expectEQ(len(c.emailSink), 1)
 		msg := <-c.emailSink
 		sender0 = msg.Sender
-		sender, _, err := email.RemoveAddrContext(msg.Sender)
+		body0 = msg.Body
+		sender, extBugID, err := email.RemoveAddrContext(msg.Sender)
 		if err != nil {
 			t.Fatalf("failed to remove sender context: %v", err)
 		}
+		extBugID0 = extBugID
+		_, dbCrash, dbBuild := c.loadBug(extBugID0)
+		crashLogLink := externalLink(c.ctx, textCrashLog, dbCrash.Log)
+		kernelConfigLink := externalLink(c.ctx, textKernelConfig, dbBuild.KernelConfig)
 		c.expectEQ(sender, fromAddr(c.ctx))
 		to := config.Namespaces["test2"].Reporting[0].Config.(*EmailConfig).Email
 		c.expectEQ(msg.To, []string{to})
 		c.expectEQ(msg.Subject, crash.Title)
-		c.expectEQ(len(msg.Attachments), 2)
-		c.expectEQ(msg.Attachments[0].Name, "config.txt")
-		c.expectEQ(msg.Attachments[0].Data, build.KernelConfig)
-		c.expectEQ(msg.Attachments[1].Name, "raw.log")
-		c.expectEQ(msg.Attachments[1].Data, crash.Log)
-		body := `Hello,
+		c.expectEQ(len(msg.Attachments), 0)
+		body := fmt.Sprintf(`Hello,
 
-syzkaller hit the following crash on kernel_commit1
-repo1/branch1
+syzbot hit the following crash on repo1/branch1 commit
+kernel_commit1 (Sat Feb 3 04:05:06 0001 +0000)
+kernel_commit_title1
+syzbot dashboard link: https://testapp.appspot.com/bug?extid=%[1]v
+
+Unfortunately, I don't have any reproducer for this crash yet.
+Raw console output: %[2]v
+Kernel config: %[3]v
 compiler: compiler1
-.config is attached
-Raw console output is attached.
-
-
 CC: [bar@foo.com foo@bar.com]
+
+IMPORTANT: if you fix the bug, please add the following tag to the commit:
+Reported-by: syzbot+%[1]v@testapp.appspotmail.com
+It will help syzbot understand when the bug is fixed. See footer for details.
+If you forward the report, please keep this part and the footer.
 
 report1
 
@@ -64,16 +72,22 @@ See https://goo.gl/tpsmEJ for details.
 Direct all questions to syzkaller@googlegroups.com.
 
 syzbot will keep track of this bug report.
-Once a fix for this bug is committed, please reply to this email with:
+If you forgot to add the Reported-by tag, once the fix for this bug is merged
+into any tree, please reply to this email with:
 #syz fix: exact-commit-title
 To mark this as a duplicate of another syzbot report, please reply with:
 #syz dup: exact-subject-of-another-report
 If it's a one-off invalid bug report, please reply with:
 #syz invalid
 Note: if the crash happens again, it will cause creation of a new bug report.
+Note: all commands must start from beginning of the line in the email body.
 To upstream this report, please reply with:
-#syz upstream`
-		c.expectEQ(msg.Body, body)
+#syz upstream`, extBugID0, crashLogLink, kernelConfigLink)
+		if msg.Body != body {
+			t.Fatalf("got email body:\n%s\n\nwant:\n%s", msg.Body, body)
+		}
+		c.checkURLContents(crashLogLink, crash.Log)
+		c.checkURLContents(kernelConfigLink, build.KernelConfig)
 	}
 
 	// Emulate receive of the report from a mailing list.
@@ -89,7 +103,8 @@ Content-Type: text/plain
 Hello
 
 syzbot will keep track of this bug report.
-Once a fix for this bug is committed, please reply to this email with:
+If you forgot to add the Reported-by tag, once the fix for this bug is merged
+into any tree, please reply to this email with:
 #syz fix: exact-commit-title
 To mark this as a duplicate of another syzbot report, please reply with:
 #syz dup: exact-subject-of-another-report
@@ -106,10 +121,14 @@ For more options, visit https://groups.google.com/d/optout.
 
 	c.expectOK(c.POST("/_ah/mail/", incoming1))
 
+	// Emulate that somebody sends us our own email back without quoting.
+	// We used to extract "#syz fix: exact-commit-title" from it.
+	c.incomingEmail(sender0, body0)
+
 	// Now report syz reproducer and check updated email.
 	crash.ReproOpts = []byte("repro opts")
 	crash.ReproSyz = []byte("getpid()")
-	syzRepro := []byte(fmt.Sprintf("#%s\n%s", crash.ReproOpts, crash.ReproSyz))
+	syzRepro := []byte(fmt.Sprintf("%s#%s\n%s", syzReproPrefix, crash.ReproOpts, crash.ReproSyz))
 	c.expectOK(c.API(client2, key2, "report_crash", crash, nil))
 
 	{
@@ -121,51 +140,51 @@ For more options, visit https://groups.google.com/d/optout.
 		if err != nil {
 			t.Fatalf("failed to remove sender context: %v", err)
 		}
+		_, dbCrash, dbBuild := c.loadBug(extBugID0)
+		reproSyzLink := externalLink(c.ctx, textReproSyz, dbCrash.ReproSyz)
+		crashLogLink := externalLink(c.ctx, textCrashLog, dbCrash.Log)
+		kernelConfigLink := externalLink(c.ctx, textKernelConfig, dbBuild.KernelConfig)
 		c.expectEQ(sender, fromAddr(c.ctx))
-		var to []string
-		to = append(to, "foo@bar.com")
-		to = append(to, config.Namespaces["test2"].Reporting[0].Config.(*EmailConfig).Email)
+		to := []string{
+			"bugs@syzkaller.com",
+			"default@sender.com", // This is from incomingEmail.
+			"foo@bar.com",
+			config.Namespaces["test2"].Reporting[0].Config.(*EmailConfig).Email,
+		}
 		c.expectEQ(msg.To, to)
-		c.expectEQ(msg.Subject, crash.Title)
-		c.expectEQ(len(msg.Attachments), 3)
-		c.expectEQ(msg.Attachments[0].Name, "config.txt")
-		c.expectEQ(msg.Attachments[0].Data, build.KernelConfig)
-		c.expectEQ(msg.Attachments[1].Name, "raw.log")
-		c.expectEQ(msg.Attachments[1].Data, crash.Log)
-		c.expectEQ(msg.Attachments[2].Name, "repro.txt")
-		c.expectEQ(msg.Attachments[2].Data, syzRepro)
+		c.expectEQ(msg.Subject, "Re: "+crash.Title)
+		c.expectEQ(len(msg.Attachments), 0)
 		c.expectEQ(msg.Headers["In-Reply-To"], []string{"<1234>"})
-		body := `syzkaller has found reproducer for the following crash on kernel_commit1
-repo1/branch1
-compiler: compiler1
-.config is attached
-Raw console output is attached.
+		body := fmt.Sprintf(`syzbot has found reproducer for the following crash on repo1/branch1 commit
+kernel_commit1 (Sat Feb 3 04:05:06 0001 +0000)
+kernel_commit_title1
+syzbot dashboard link: https://testapp.appspot.com/bug?extid=%[1]v
 
-syzkaller reproducer is attached. See https://goo.gl/kgGztJ
-for information about syzkaller reproducers
+So far this crash happened 2 times on repo1/branch1.
+syzkaller reproducer: %[2]v
+Raw console output: %[3]v
+Kernel config: %[4]v
+compiler: compiler1
 CC: [bar@foo.com foo@bar.com]
 
+IMPORTANT: if you fix the bug, please add the following tag to the commit:
+Reported-by: syzbot+%[1]v@testapp.appspotmail.com
+It will help syzbot understand when the bug is fixed.
+
 report1
-`
-		c.expectEQ(msg.Body, body)
+`, extBugID0, reproSyzLink, crashLogLink, kernelConfigLink)
+		if msg.Body != body {
+			t.Fatalf("got email body:\n%s\n\nwant:\n%s", msg.Body, body)
+		}
+		c.checkURLContents(reproSyzLink, syzRepro)
+		c.checkURLContents(crashLogLink, crash.Log)
+		c.checkURLContents(kernelConfigLink, build.KernelConfig)
 	}
 
 	// Now upstream the bug and check that it reaches the next reporting.
-	incoming2 := fmt.Sprintf(`Sender: syzkaller@googlegroups.com
-Date: Tue, 15 Aug 2017 14:59:00 -0700
-Message-ID: <1234>
-Subject: crash1
-From: foo@bar.com
-To: foo@bar.com
-Cc: %v
-Content-Type: text/plain
+	c.incomingEmail(sender0, "#syz upstream")
 
-#syz upstream
-`, sender0)
-
-	c.expectOK(c.POST("/_ah/mail/", incoming2))
-
-	sender1 := ""
+	sender1, extBugID1 := "", ""
 	{
 		c.expectOK(c.GET("/email_poll"))
 		c.expectEQ(len(c.emailSink), 1)
@@ -174,31 +193,37 @@ Content-Type: text/plain
 		if sender1 == sender0 {
 			t.Fatalf("same ID in different reporting")
 		}
-		sender, _, err := email.RemoveAddrContext(msg.Sender)
+		sender, extBugID, err := email.RemoveAddrContext(msg.Sender)
 		if err != nil {
 			t.Fatalf("failed to remove sender context: %v", err)
 		}
+		extBugID1 = extBugID
+		_, dbCrash, dbBuild := c.loadBug(extBugID1)
+		reproSyzLink := externalLink(c.ctx, textReproSyz, dbCrash.ReproSyz)
+		crashLogLink := externalLink(c.ctx, textCrashLog, dbCrash.Log)
+		kernelConfigLink := externalLink(c.ctx, textKernelConfig, dbBuild.KernelConfig)
 		c.expectEQ(sender, fromAddr(c.ctx))
-		c.expectEQ(msg.To, []string{"bar@foo.com", "bugs@syzkaller.com", "foo@bar.com"})
+		c.expectEQ(msg.To, []string{"bar@foo.com", "bugs@syzkaller.com",
+			"default@maintainers.com", "foo@bar.com"})
 		c.expectEQ(msg.Subject, crash.Title)
-		c.expectEQ(len(msg.Attachments), 3)
-		c.expectEQ(msg.Attachments[0].Name, "config.txt")
-		c.expectEQ(msg.Attachments[0].Data, build.KernelConfig)
-		c.expectEQ(msg.Attachments[1].Name, "raw.log")
-		c.expectEQ(msg.Attachments[1].Data, crash.Log)
-		c.expectEQ(msg.Attachments[2].Name, "repro.txt")
-		c.expectEQ(msg.Attachments[2].Data, syzRepro)
-		body := `Hello,
+		c.expectEQ(len(msg.Attachments), 0)
+		body := fmt.Sprintf(`Hello,
 
-syzkaller hit the following crash on kernel_commit1
-repo1/branch1
+syzbot hit the following crash on repo1/branch1 commit
+kernel_commit1 (Sat Feb 3 04:05:06 0001 +0000)
+kernel_commit_title1
+syzbot dashboard link: https://testapp.appspot.com/bug?extid=%[1]v
+
+So far this crash happened 2 times on repo1/branch1.
+syzkaller reproducer: %[2]v
+Raw console output: %[3]v
+Kernel config: %[4]v
 compiler: compiler1
-.config is attached
-Raw console output is attached.
 
-syzkaller reproducer is attached. See https://goo.gl/kgGztJ
-for information about syzkaller reproducers
-
+IMPORTANT: if you fix the bug, please add the following tag to the commit:
+Reported-by: syzbot+%[1]v@testapp.appspotmail.com
+It will help syzbot understand when the bug is fixed. See footer for details.
+If you forward the report, please keep this part and the footer.
 
 report1
 
@@ -208,15 +233,25 @@ See https://goo.gl/tpsmEJ for details.
 Direct all questions to syzkaller@googlegroups.com.
 
 syzbot will keep track of this bug report.
-Once a fix for this bug is committed, please reply to this email with:
+If you forgot to add the Reported-by tag, once the fix for this bug is merged
+into any tree, please reply to this email with:
 #syz fix: exact-commit-title
+If you want to test a patch for this bug, please reply with:
+#syz test: git://repo/address.git branch
+and provide the patch inline or as an attachment.
 To mark this as a duplicate of another syzbot report, please reply with:
 #syz dup: exact-subject-of-another-report
 If it's a one-off invalid bug report, please reply with:
 #syz invalid
 Note: if the crash happens again, it will cause creation of a new bug report.
-`
-		c.expectEQ(msg.Body, body)
+Note: all commands must start from beginning of the line in the email body.
+`, extBugID1, reproSyzLink, crashLogLink, kernelConfigLink)
+		if msg.Body != body {
+			t.Fatalf("got email body:\n%s\n\nwant:\n%s", msg.Body, body)
+		}
+		c.checkURLContents(reproSyzLink, syzRepro)
+		c.checkURLContents(crashLogLink, crash.Log)
+		c.checkURLContents(kernelConfigLink, build.KernelConfig)
 	}
 
 	// Model that somebody adds more emails to CC list.
@@ -235,6 +270,9 @@ Content-Type: text/plain
 	c.expectOK(c.POST("/_ah/mail/", incoming3))
 
 	// Now upload a C reproducer.
+	build2 := testBuild(2)
+	c.expectOK(c.API(client2, key2, "upload_build", build2, nil))
+	crash.BuildID = build2.ID
 	crash.ReproC = []byte("int main() {}")
 	crash.Maintainers = []string{"\"qux\" <qux@qux.com>"}
 	c.expectOK(c.API(client2, key2, "report_crash", crash, nil))
@@ -248,31 +286,41 @@ Content-Type: text/plain
 		if err != nil {
 			t.Fatalf("failed to remove sender context: %v", err)
 		}
+		_, dbCrash, dbBuild := c.loadBug(extBugID1)
+		reproCLink := externalLink(c.ctx, textReproC, dbCrash.ReproC)
+		reproSyzLink := externalLink(c.ctx, textReproSyz, dbCrash.ReproSyz)
+		crashLogLink := externalLink(c.ctx, textCrashLog, dbCrash.Log)
+		kernelConfigLink := externalLink(c.ctx, textKernelConfig, dbBuild.KernelConfig)
 		c.expectEQ(sender, fromAddr(c.ctx))
-		c.expectEQ(msg.To, []string{"another@another.com", "bar@foo.com", "bugs@syzkaller.com", "foo@bar.com", "new@new.com", "qux@qux.com"})
-		c.expectEQ(msg.Subject, crash.Title)
-		c.expectEQ(len(msg.Attachments), 4)
-		c.expectEQ(msg.Attachments[0].Name, "config.txt")
-		c.expectEQ(msg.Attachments[0].Data, build.KernelConfig)
-		c.expectEQ(msg.Attachments[1].Name, "raw.log")
-		c.expectEQ(msg.Attachments[1].Data, crash.Log)
-		c.expectEQ(msg.Attachments[2].Name, "repro.txt")
-		c.expectEQ(msg.Attachments[2].Data, syzRepro)
-		c.expectEQ(msg.Attachments[3].Name, "repro.c")
-		c.expectEQ(msg.Attachments[3].Data, crash.ReproC)
-		body := `syzkaller has found reproducer for the following crash on kernel_commit1
-repo1/branch1
-compiler: compiler1
-.config is attached
-Raw console output is attached.
-C reproducer is attached
-syzkaller reproducer is attached. See https://goo.gl/kgGztJ
-for information about syzkaller reproducers
+		c.expectEQ(msg.To, []string{"another@another.com", "bar@foo.com", "bugs@syzkaller.com",
+			"default@maintainers.com", "foo@bar.com", "new@new.com", "qux@qux.com"})
+		c.expectEQ(msg.Subject, "Re: "+crash.Title)
+		c.expectEQ(len(msg.Attachments), 0)
+		body := fmt.Sprintf(`syzbot has found reproducer for the following crash on repo2/branch2 commit
+kernel_commit2 (Sat Feb 3 04:05:06 0001 +0000)
+kernel_commit_title2
+syzbot dashboard link: https://testapp.appspot.com/bug?extid=%[1]v
 
+So far this crash happened 3 times on repo1/branch1, repo2/branch2.
+C reproducer: %[2]v
+syzkaller reproducer: %[3]v
+Raw console output: %[4]v
+Kernel config: %[5]v
+compiler: compiler2
+
+IMPORTANT: if you fix the bug, please add the following tag to the commit:
+Reported-by: syzbot+%[1]v@testapp.appspotmail.com
+It will help syzbot understand when the bug is fixed.
 
 report1
-`
-		c.expectEQ(msg.Body, body)
+`, extBugID1, reproCLink, reproSyzLink, crashLogLink, kernelConfigLink)
+		if msg.Body != body {
+			t.Fatalf("got email body:\n%s\n\nwant:\n%s", msg.Body, body)
+		}
+		c.checkURLContents(reproCLink, crash.ReproC)
+		c.checkURLContents(reproSyzLink, syzRepro)
+		c.checkURLContents(crashLogLink, crash.Log)
+		c.checkURLContents(kernelConfigLink, build2.KernelConfig)
 	}
 
 	// Send an invalid command.
@@ -294,7 +342,7 @@ Content-Type: text/plain
 		c.expectEQ(len(c.emailSink), 1)
 		msg := <-c.emailSink
 		c.expectEQ(msg.To, []string{"<foo@bar.com>"})
-		c.expectEQ(msg.Subject, crash.Title)
+		c.expectEQ(msg.Subject, "Re: title1")
 		c.expectEQ(msg.Headers["In-Reply-To"], []string{"<abcdef>"})
 		if !strings.Contains(msg.Body, `> #syz bad-command
 
@@ -304,18 +352,8 @@ unknown command "bad-command"
 		}
 	}
 
-	// Now mark the bug as invalid.
-	incoming5 := fmt.Sprintf(`Sender: syzkaller@googlegroups.com
-Date: Tue, 15 Aug 2017 14:59:00 -0700
-Message-ID: <abcdef>
-Subject: title1
-From: foo@bar.com
-To: %v
-Content-Type: text/plain
-
-#syz fix: some: commit title
-`, sender1)
-	c.expectOK(c.POST("/_ah/mail/", incoming5))
+	// Now mark the bug as fixed.
+	c.incomingEmail(sender1, "#syz fix: some: commit title")
 	c.expectOK(c.GET("/email_poll"))
 	c.expectEQ(len(c.emailSink), 0)
 
@@ -326,10 +364,15 @@ Content-Type: text/plain
 	c.expectEQ(len(builderPollResp.PendingCommits), 1)
 	c.expectEQ(builderPollResp.PendingCommits[0], "some: commit title")
 
-	build2 := testBuild(2)
-	build2.Manager = build.Manager
-	build2.Commits = []string{"some: commit title"}
-	c.expectOK(c.API(client2, key2, "upload_build", build2, nil))
+	build3 := testBuild(3)
+	build3.Manager = build.Manager
+	build3.Commits = []string{"some: commit title"}
+	c.expectOK(c.API(client2, key2, "upload_build", build3, nil))
+
+	build4 := testBuild(4)
+	build4.Manager = build2.Manager
+	build4.Commits = []string{"some: commit title"}
+	c.expectOK(c.API(client2, key2, "upload_build", build4, nil))
 
 	// New crash must produce new bug in the first reporting.
 	c.expectOK(c.API(client2, key2, "report_crash", crash, nil))
@@ -397,17 +440,7 @@ func TestEmailDup(t *testing.T) {
 	msg2 := <-c.emailSink
 
 	// Dup crash2 to crash1.
-	incoming1 := fmt.Sprintf(`Sender: syzkaller@googlegroups.com
-Date: Tue, 15 Aug 2017 14:59:00 -0700
-Message-ID: <12345>
-Subject: title1
-From: foo@bar.com
-To: %v
-Content-Type: text/plain
-
-#syz dup: BUG: slightly more elaborate title
-`, msg2.Sender)
-	c.expectOK(c.POST("/_ah/mail/", incoming1))
+	c.incomingEmail(msg2.Sender, "#syz dup: BUG: slightly more elaborate title")
 	c.expectOK(c.GET("/email_poll"))
 	c.expectEQ(len(c.emailSink), 0)
 
@@ -418,17 +451,7 @@ Content-Type: text/plain
 	c.expectEQ(len(c.emailSink), 0)
 
 	// Now close the original bug, and check that new bugs for dup are now created.
-	incoming2 := fmt.Sprintf(`Sender: syzkaller@googlegroups.com
-Date: Tue, 15 Aug 2017 14:59:00 -0700
-Message-ID: <12345>
-Subject: title1
-From: foo@bar.com
-To: %v
-Content-Type: text/plain
-
-#syz invalid
-`, msg1.Sender)
-	c.expectOK(c.POST("/_ah/mail/", incoming2))
+	c.incomingEmail(msg1.Sender, "#syz invalid")
 
 	// New crash must produce new bug in the first reporting.
 	c.expectOK(c.API(client2, key2, "report_crash", crash2, nil))
@@ -438,4 +461,41 @@ Content-Type: text/plain
 		msg := <-c.emailSink
 		c.expectEQ(msg.Subject, crash2.Title+" (2)")
 	}
+}
+
+func TestEmailUndup(t *testing.T) {
+	c := NewCtx(t)
+	defer c.Close()
+
+	build := testBuild(1)
+	c.expectOK(c.API(client2, key2, "upload_build", build, nil))
+
+	crash1 := testCrash(build, 1)
+	crash1.Title = "BUG: slightly more elaborate title"
+	c.expectOK(c.API(client2, key2, "report_crash", crash1, nil))
+
+	crash2 := testCrash(build, 2)
+	crash1.Title = "KASAN: another title"
+	c.expectOK(c.API(client2, key2, "report_crash", crash2, nil))
+
+	c.expectOK(c.GET("/email_poll"))
+	c.expectEQ(len(c.emailSink), 2)
+	msg1 := <-c.emailSink
+	msg2 := <-c.emailSink
+
+	// Dup crash2 to crash1.
+	c.incomingEmail(msg2.Sender, "#syz dup: BUG: slightly more elaborate title")
+	c.expectOK(c.GET("/email_poll"))
+	c.expectEQ(len(c.emailSink), 0)
+
+	// Undup crash2.
+	c.incomingEmail(msg2.Sender, "#syz undup")
+	c.expectOK(c.GET("/email_poll"))
+	c.expectEQ(len(c.emailSink), 0)
+
+	// Now close the original bug, and check that new crashes for the dup does not create bugs.
+	c.incomingEmail(msg1.Sender, "#syz invalid")
+	c.expectOK(c.API(client2, key2, "report_crash", crash2, nil))
+	c.expectOK(c.GET("/email_poll"))
+	c.expectEQ(len(c.emailSink), 0)
 }

@@ -17,7 +17,7 @@ type validCtx struct {
 func (p *Prog) validate() error {
 	ctx := &validCtx{make(map[Arg]bool), make(map[Arg]Arg)}
 	for _, c := range p.Calls {
-		if err := c.validate(ctx); err != nil {
+		if err := p.validateCall(ctx, c); err != nil {
 			return err
 		}
 	}
@@ -29,7 +29,7 @@ func (p *Prog) validate() error {
 	return nil
 }
 
-func (c *Call) validate(ctx *validCtx) error {
+func (p *Prog) validateCall(ctx *validCtx, c *Call) error {
 	if c.Meta == nil {
 		return fmt.Errorf("call does not have meta information")
 	}
@@ -42,13 +42,15 @@ func (c *Call) validate(ctx *validCtx) error {
 			return fmt.Errorf("syscall %v: nil arg", c.Meta.Name)
 		}
 		if ctx.args[arg] {
-			return fmt.Errorf("syscall %v: arg is referenced several times in the tree", c.Meta.Name)
+			return fmt.Errorf("syscall %v: arg %#v is referenced several times in the tree",
+				c.Meta.Name, arg)
 		}
 		ctx.args[arg] = true
 		if used, ok := arg.(ArgUsed); ok {
 			for u := range *used.Used() {
 				if u == nil {
-					return fmt.Errorf("syscall %v: nil reference in uses for arg %+v", c.Meta.Name, arg)
+					return fmt.Errorf("syscall %v: nil reference in uses for arg %+v",
+						c.Meta.Name, arg)
 				}
 				ctx.uses[u] = arg
 			}
@@ -68,10 +70,9 @@ func (c *Call) validate(ctx *validCtx) error {
 					return fmt.Errorf("syscall %v: output arg '%v'/'%v' has non default value '%+v'", c.Meta.Name, a.Type().FieldName(), a.Type().Name(), a)
 				}
 			case *DataArg:
-				for _, v := range a.Data {
-					if v != 0 {
-						return fmt.Errorf("syscall %v: output arg '%v' has data", c.Meta.Name, a.Type().Name())
-					}
+				if len(a.data) != 0 {
+					return fmt.Errorf("syscall %v: output arg '%v' has data",
+						c.Meta.Name, a.Type().Name())
 				}
 			}
 		}
@@ -112,7 +113,7 @@ func (c *Call) validate(ctx *validCtx) error {
 		case *ProcType:
 			switch a := arg.(type) {
 			case *ConstArg:
-				if a.Val >= typ1.ValuesPerProc {
+				if a.Val >= typ1.ValuesPerProc && a.Val != typ1.Default() {
 					return fmt.Errorf("syscall %v: per proc arg '%v' has bad value '%v'", c.Meta.Name, a.Type().Name(), a.Val)
 				}
 			default:
@@ -123,9 +124,9 @@ func (c *Call) validate(ctx *validCtx) error {
 			case *DataArg:
 				switch typ1.Kind {
 				case BufferString:
-					if typ1.TypeSize != 0 && uint64(len(a.Data)) != typ1.TypeSize {
+					if typ1.TypeSize != 0 && a.Size() != typ1.TypeSize {
 						return fmt.Errorf("syscall %v: string arg '%v' has size %v, which should be %v",
-							c.Meta.Name, a.Type().Name(), len(a.Data), typ1.TypeSize)
+							c.Meta.Name, a.Type().Name(), a.Size(), typ1.TypeSize)
 					}
 				}
 			default:
@@ -156,13 +157,23 @@ func (c *Call) validate(ctx *validCtx) error {
 		switch a := arg.(type) {
 		case *ConstArg:
 		case *PointerArg:
+			maxMem := p.Target.NumPages * p.Target.PageSize
+			size := a.VmaSize
+			if size == 0 && a.Res != nil {
+				size = a.Res.Size()
+			}
+			if a.Address >= maxMem || a.Address+size > maxMem {
+				return fmt.Errorf("syscall %v: ptr %v has bad address %v/%v/%v",
+					c.Meta.Name, a.Type().Name(), a.Address, a.VmaSize, size)
+			}
 			switch t := a.Type().(type) {
 			case *VmaType:
 				if a.Res != nil {
 					return fmt.Errorf("syscall %v: vma arg '%v' has data", c.Meta.Name, a.Type().Name())
 				}
-				if a.PagesNum == 0 && t.Dir() != DirOut && !t.Optional() {
-					return fmt.Errorf("syscall %v: vma arg '%v' has size 0", c.Meta.Name, a.Type().Name())
+				if a.VmaSize == 0 && t.Dir() != DirOut && !t.Optional() {
+					return fmt.Errorf("syscall %v: vma arg '%v' has size 0",
+						c.Meta.Name, a.Type().Name())
 				}
 			case *PtrType:
 				if a.Res != nil {
@@ -170,17 +181,24 @@ func (c *Call) validate(ctx *validCtx) error {
 						return err
 					}
 				}
-				if a.PagesNum != 0 {
-					return fmt.Errorf("syscall %v: pointer arg '%v' has nonzero size", c.Meta.Name, a.Type().Name())
+				if a.VmaSize != 0 {
+					return fmt.Errorf("syscall %v: pointer arg '%v' has nonzero size",
+						c.Meta.Name, a.Type().Name())
 				}
 			default:
 				return fmt.Errorf("syscall %v: pointer arg '%v' has bad meta type %+v", c.Meta.Name, arg.Type().Name(), arg.Type())
 			}
 		case *DataArg:
+			typ1 := a.Type()
+			if !typ1.Varlen() && typ1.Size() != a.Size() {
+				return fmt.Errorf("syscall %v: data arg %v has wrong size %v, want %v",
+					c.Meta.Name, arg.Type().Name(), a.Size(), typ1.Size())
+			}
 			switch typ1 := a.Type().(type) {
 			case *ArrayType:
 				if typ2, ok := typ1.Type.(*IntType); !ok || typ2.Size() != 1 {
-					return fmt.Errorf("syscall %v: data arg '%v' should be an array", c.Meta.Name, a.Type().Name())
+					return fmt.Errorf("syscall %v: data arg '%v' should be an array",
+						c.Meta.Name, a.Type().Name())
 				}
 			}
 		case *GroupArg:
@@ -195,6 +213,13 @@ func (c *Call) validate(ctx *validCtx) error {
 					}
 				}
 			case *ArrayType:
+				if typ1.Kind == ArrayRangeLen && typ1.RangeBegin == typ1.RangeEnd &&
+					uint64(len(a.Inner)) != typ1.RangeBegin {
+					return fmt.Errorf("syscall %v: array %v has wrong number"+
+						" of elements %v, want %v",
+						c.Meta.Name, arg.Type().Name(),
+						len(a.Inner), typ1.RangeBegin)
+				}
 				for _, arg1 := range a.Inner {
 					if err := checkArg(arg1); err != nil {
 						return err
@@ -210,7 +235,7 @@ func (c *Call) validate(ctx *validCtx) error {
 			}
 			found := false
 			for _, typ2 := range typ1.Fields {
-				if a.OptionType.Name() == typ2.Name() {
+				if a.Option.Type().Name() == typ2.Name() {
 					found = true
 					break
 				}
@@ -231,11 +256,12 @@ func (c *Call) validate(ctx *validCtx) error {
 				break
 			}
 			if !ctx.args[a.Res] {
-				return fmt.Errorf("syscall %v: result arg '%v' references out-of-tree result: %p%+v -> %p%+v",
-					c.Meta.Name, a.Type().Name(), arg, arg, a.Res, a.Res)
+				return fmt.Errorf("syscall %v: result arg %v references out-of-tree result: %#v -> %#v",
+					c.Meta.Name, a.Type().Name(), arg, a.Res)
 			}
-			if _, ok := (*a.Res.(ArgUsed).Used())[arg]; !ok {
-				return fmt.Errorf("syscall %v: result arg '%v' has broken link (%+v)", c.Meta.Name, a.Type().Name(), *a.Res.(ArgUsed).Used())
+			if !(*a.Res.(ArgUsed).Used())[arg] {
+				return fmt.Errorf("syscall %v: result arg '%v' has broken link (%+v)",
+					c.Meta.Name, a.Type().Name(), *a.Res.(ArgUsed).Used())
 			}
 		case *ReturnArg:
 			switch a.Type().(type) {

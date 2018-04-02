@@ -35,22 +35,19 @@ type Result struct {
 	Opts     csource.Options
 	CRepro   bool
 	Stats    Stats
-	// Description, log and report of the final crash that we reproduced.
+	// Information about the final (non-symbolized) crash that we reproduced.
 	// Can be different from what we started reproducing.
-	Desc   string
-	Log    []byte
-	Report []byte
+	Report *report.Report
 }
 
 type context struct {
 	cfg          *mgrconfig.Config
-	crashDesc    string
+	reporter     report.Reporter
+	crashTitle   string
 	instances    chan *instance
 	bootRequests chan int
 	stats        Stats
-	desc         string
-	log          []byte
-	report       []byte
+	report       *report.Report
 }
 
 type instance struct {
@@ -60,7 +57,8 @@ type instance struct {
 	executorBin string
 }
 
-func Run(crashLog []byte, cfg *mgrconfig.Config, vmPool *vm.Pool, vmIndexes []int) (*Result, error) {
+func Run(crashLog []byte, cfg *mgrconfig.Config, reporter report.Reporter, vmPool *vm.Pool,
+	vmIndexes []int) (*Result, error) {
 	if len(vmIndexes) == 0 {
 		return nil, fmt.Errorf("no VMs provided")
 	}
@@ -72,15 +70,17 @@ func Run(crashLog []byte, cfg *mgrconfig.Config, vmPool *vm.Pool, vmIndexes []in
 	if len(entries) == 0 {
 		return nil, fmt.Errorf("crash log does not contain any programs")
 	}
-	crashDesc, _, crashStart, _ := report.Parse(crashLog, cfg.ParsedIgnores)
-	if crashDesc == "" {
-		crashStart = len(crashLog) // assuming VM hanged
-		crashDesc = "hang"
+	crashStart := len(crashLog) // assuming VM hanged
+	crashTitle := "hang"
+	if rep := reporter.Parse(crashLog); rep != nil {
+		crashStart = rep.StartPos
+		crashTitle = rep.Title
 	}
 
 	ctx := &context{
 		cfg:          cfg,
-		crashDesc:    crashDesc,
+		reporter:     reporter,
+		crashTitle:   crashTitle,
 		instances:    make(chan *instance, len(vmIndexes)),
 		bootRequests: make(chan int, len(vmIndexes)),
 	}
@@ -147,11 +147,24 @@ func Run(crashLog []byte, cfg *mgrconfig.Config, vmPool *vm.Pool, vmIndexes []in
 		return nil, err
 	}
 	if res != nil {
-		ctx.reproLog(3, "repro crashed as:\n%s", string(ctx.report))
-		res.Stats = ctx.stats
-		res.Desc = ctx.desc
-		res.Log = ctx.log
+		ctx.reproLog(3, "repro crashed as (corrupted=%v):\n%s",
+			ctx.report.Corrupted, ctx.report.Report)
+		// Try to rerun the repro if the report is corrupted.
+		for attempts := 0; ctx.report.Corrupted && attempts < 3; attempts++ {
+			ctx.reproLog(3, "report is corrupted, running repro again")
+			if res.CRepro {
+				_, err = ctx.testCProg(res.Prog, res.Duration, res.Opts)
+			} else {
+				_, err = ctx.testProg(res.Prog, res.Duration, res.Opts)
+			}
+			if err != nil {
+				return nil, err
+			}
+		}
+		ctx.reproLog(3, "final repro crashed as (corrupted=%v):\n%s",
+			ctx.report.Corrupted, ctx.report.Report)
 		res.Report = ctx.report
+		res.Stats = ctx.stats
 	}
 
 	close(ctx.bootRequests)
@@ -256,6 +269,11 @@ func (ctx *context) extractProg(entries []*prog.LogEntry) (*Result, error) {
 			return res, nil
 		}
 
+		// Don't try bisecting if there's only one entry.
+		if len(entries) == 1 {
+			continue
+		}
+
 		// Execute all programs and bisect the log to find multiple guilty programs.
 		res, err = ctx.extractProgBisect(reverseEntries(entries), timeout)
 		if err != nil {
@@ -273,16 +291,17 @@ func (ctx *context) extractProg(entries []*prog.LogEntry) (*Result, error) {
 
 func (ctx *context) createDefaultOps() csource.Options {
 	opts := csource.Options{
-		Threaded:   true,
-		Collide:    true,
-		Repeat:     true,
-		Procs:      ctx.cfg.Procs,
-		Sandbox:    ctx.cfg.Sandbox,
-		EnableTun:  true,
-		UseTmpDir:  true,
-		HandleSegv: true,
-		WaitRepeat: true,
-		Repro:      true,
+		Threaded:      true,
+		Collide:       true,
+		Repeat:        true,
+		Procs:         ctx.cfg.Procs,
+		Sandbox:       ctx.cfg.Sandbox,
+		EnableTun:     true,
+		EnableCgroups: true,
+		UseTmpDir:     true,
+		HandleSegv:    true,
+		WaitRepeat:    true,
+		Repro:         true,
 	}
 	return opts
 }
@@ -351,9 +370,9 @@ func (ctx *context) extractProgBisect(entries []*prog.LogEntry, baseDuration tim
 	for _, entry := range entries {
 		prog.Calls = append(prog.Calls, entry.P.Calls...)
 	}
+	dur := duration(len(entries)) * 3 / 2
 
 	// Execute the program without fault injection.
-	dur := duration(len(entries)) * 3 / 2
 	crashed, err := ctx.testProg(prog, dur, opts)
 	if err != nil {
 		return nil, err
@@ -364,7 +383,7 @@ func (ctx *context) extractProgBisect(entries []*prog.LogEntry, baseDuration tim
 			Duration: dur,
 			Opts:     opts,
 		}
-		ctx.reproLog(3, "bisect: concatenation succeded")
+		ctx.reproLog(3, "bisect: concatenation succeeded")
 		return res, nil
 	}
 
@@ -410,14 +429,15 @@ func (ctx *context) minimizeProg(res *Result) (*Result, error) {
 	if res.Opts.Fault {
 		call = res.Opts.FaultCall
 	}
-	res.Prog, res.Opts.FaultCall = prog.Minimize(res.Prog, call, func(p1 *prog.Prog, callIndex int) bool {
-		crashed, err := ctx.testProg(p1, res.Duration, res.Opts)
-		if err != nil {
-			ctx.reproLog(0, "minimization failed with %v", err)
-			return false
-		}
-		return crashed
-	}, true)
+	res.Prog, res.Opts.FaultCall = prog.Minimize(res.Prog, call, true,
+		func(p1 *prog.Prog, callIndex int) bool {
+			crashed, err := ctx.testProg(p1, res.Duration, res.Opts)
+			if err != nil {
+				ctx.reproLog(0, "minimization failed with %v", err)
+				return false
+			}
+			return crashed
+		})
 
 	return res, nil
 }
@@ -439,7 +459,7 @@ func (ctx *context) simplifyProg(res *Result) (*Result, error) {
 			}
 			if crashed {
 				res.Opts = opts
-				// Simplification successfull, try extracting C repro.
+				// Simplification successful, try extracting C repro.
 				res, err := ctx.extractC(res)
 				if err != nil {
 					return nil, err
@@ -591,15 +611,13 @@ func (ctx *context) testImpl(inst *vm.Instance, command string, duration time.Du
 	if err != nil {
 		return false, fmt.Errorf("failed to run command in VM: %v", err)
 	}
-	desc, report, output, crashed, _ := vm.MonitorExecution(outc, errc, false, ctx.cfg.ParsedIgnores)
-	if !crashed {
+	rep := vm.MonitorExecution(outc, errc, ctx.reporter, true)
+	if rep == nil {
 		ctx.reproLog(2, "program did not crash")
 		return false, nil
 	}
-	ctx.desc = desc
-	ctx.log = output
-	ctx.report = report
-	ctx.reproLog(2, "program crashed: %v", desc)
+	ctx.report = rep
+	ctx.reproLog(2, "program crashed: %v", rep.Title)
 	return true, nil
 }
 
@@ -609,7 +627,7 @@ func (ctx *context) returnInstance(inst *instance) {
 }
 
 func (ctx *context) reproLog(level int, format string, args ...interface{}) {
-	prefix := fmt.Sprintf("reproducing crash '%v': ", ctx.crashDesc)
+	prefix := fmt.Sprintf("reproducing crash '%v': ", ctx.crashTitle)
 	Logf(level, prefix+format, args...)
 	ctx.stats.Log = append(ctx.stats.Log, []byte(fmt.Sprintf(format, args...)+"\n")...)
 }
@@ -664,7 +682,7 @@ again:
 		ctx.reproLog(3, "bisect: guilty chunks split: %v, <%v>, %v", logGuilty(guilty1), len(chunk), logGuilty(guilty2))
 
 		chunk1 := chunk[0 : len(chunk)/2]
-		chunk2 := chunk[len(chunk)/2 : len(chunk)]
+		chunk2 := chunk[len(chunk)/2:]
 		ctx.reproLog(3, "bisect: chunk split: <%v> => <%v>, <%v>", len(chunk), len(chunk1), len(chunk2))
 
 		ctx.reproLog(3, "bisect: triggering crash without chunk #1")
@@ -773,6 +791,7 @@ var progSimplifies = []Simplify{
 			return false
 		}
 		opts.Repeat = false
+		opts.WaitRepeat = false
 		opts.Procs = 1
 		return true
 	},
@@ -798,6 +817,8 @@ var cSimplifies = append(progSimplifies, []Simplify{
 			return false
 		}
 		opts.Sandbox = ""
+		opts.EnableTun = false
+		opts.EnableCgroups = false
 		return true
 	},
 	func(opts *csource.Options) bool {
@@ -808,7 +829,14 @@ var cSimplifies = append(progSimplifies, []Simplify{
 		return true
 	},
 	func(opts *csource.Options) bool {
-		if !opts.UseTmpDir || opts.Sandbox == "namespace" {
+		if !opts.EnableCgroups {
+			return false
+		}
+		opts.EnableCgroups = false
+		return true
+	},
+	func(opts *csource.Options) bool {
+		if !opts.UseTmpDir || opts.Sandbox == "namespace" || opts.EnableCgroups {
 			return false
 		}
 		opts.UseTmpDir = false

@@ -41,6 +41,11 @@ package main
 //		workdir/	: manager workdir (never deleted)
 //		latest/		: latest good kernel image build
 //		current/	: kernel image currently in use
+// jobs/
+//	linux/			: one dir per target OS
+//		kernel/		: kernel checkout
+//		image/		: currently used image
+//		workdir/	: some temp files
 //
 // Current executable, syzkaller and kernel builds are marked with tag files.
 // Tag files uniquely identify the build (git hash, compiler identity, kernel config, etc).
@@ -64,14 +69,17 @@ var flagConfig = flag.String("config", "", "config file")
 
 type Config struct {
 	Name                   string
-	Http                   string
+	HTTP                   string
 	Dashboard_Addr         string // Optional.
+	Dashboard_Client       string // Optional.
+	Dashboard_Key          string // Optional.
 	Hub_Addr               string // Optional.
 	Hub_Key                string // Optional.
 	Goroot                 string // Go 1.8+ toolchain dir.
 	Syzkaller_Repo         string
 	Syzkaller_Branch       string
 	Syzkaller_Descriptions string // Dir with additional syscall descriptions (.txt and .const files).
+	Enable_Jobs            bool   // Enable patch testing jobs.
 	Managers               []*ManagerConfig
 }
 
@@ -80,6 +88,7 @@ type ManagerConfig struct {
 	Dashboard_Client string
 	Dashboard_Key    string
 	Repo             string
+	Repo_Alias       string // Short name of the repo (e.g. "linux-next"), used only for reporting.
 	Branch           string
 	Compiler         string
 	Userspace        string
@@ -108,6 +117,8 @@ func main() {
 		close(updatePending)
 	}()
 
+	var wg sync.WaitGroup
+	wg.Add(1)
 	stop := make(chan struct{})
 	go func() {
 		select {
@@ -115,23 +126,30 @@ func main() {
 		case <-updatePending:
 		}
 		close(stop)
+		wg.Done()
 	}()
 
-	var wg sync.WaitGroup
-	wg.Add(len(cfg.Managers))
 	managers := make([]*Manager, len(cfg.Managers))
 	for i, mgrcfg := range cfg.Managers {
 		managers[i] = createManager(cfg, mgrcfg, stop)
 	}
 	for _, mgr := range managers {
 		mgr := mgr
+		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			mgr.loop()
 		}()
 	}
+	if cfg.Enable_Jobs {
+		jp := newJobProcessor(cfg, managers)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			jp.loop(stop)
+		}()
+	}
 
-	<-stop
 	wg.Wait()
 
 	select {
@@ -153,7 +171,7 @@ func loadConfig(filename string) (*Config, error) {
 	if cfg.Name == "" {
 		return nil, fmt.Errorf("param 'name' is empty")
 	}
-	if cfg.Http == "" {
+	if cfg.HTTP == "" {
 		return nil, fmt.Errorf("param 'http' is empty")
 	}
 	if len(cfg.Managers) == 0 {

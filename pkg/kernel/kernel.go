@@ -25,24 +25,31 @@ import (
 )
 
 func Build(dir, compiler, config string) error {
-	if err := osutil.CopyFile(config, filepath.Join(dir, ".config")); err != nil {
+	configFile := filepath.Join(dir, ".config")
+	if err := osutil.CopyFile(config, configFile); err != nil {
 		return fmt.Errorf("failed to write config file: %v", err)
 	}
-	return build(dir, compiler)
-}
-
-func build(dir, compiler string) error {
-	const timeout = 10 * time.Minute // default timeout for command invocations
-	if _, err := osutil.RunCmd(timeout, dir, "make", "olddefconfig"); err != nil {
+	if err := osutil.SandboxChown(configFile); err != nil {
+		return err
+	}
+	cmd := osutil.Command("make", "olddefconfig")
+	if err := osutil.Sandbox(cmd, true, true); err != nil {
+		return err
+	}
+	cmd.Dir = dir
+	if _, err := osutil.Run(10*time.Minute, cmd); err != nil {
 		return err
 	}
 	// We build only bzImage as we currently don't use modules.
-	// Build of a large kernel can take a while on a 1 CPU VM.
 	cpu := strconv.Itoa(runtime.NumCPU())
-	if _, err := osutil.RunCmd(3*time.Hour, dir, "make", "bzImage", "-j", cpu, "CC="+compiler); err != nil {
+	cmd = osutil.Command("make", "bzImage", "-j", cpu, "CC="+compiler)
+	if err := osutil.Sandbox(cmd, true, true); err != nil {
 		return err
 	}
-	return nil
+	cmd.Dir = dir
+	// Build of a large kernel can take a while on a 1 CPU VM.
+	_, err := osutil.Run(3*time.Hour, cmd)
+	return err
 }
 
 // CreateImage creates a disk image that is suitable for syzkaller.
@@ -61,12 +68,14 @@ func CreateImage(kernelDir, userspaceDir, cmdlineFile, sysctlFile, image, sshkey
 		return fmt.Errorf("failed to write script file: %v", err)
 	}
 	bzImage := filepath.Join(kernelDir, filepath.FromSlash("arch/x86/boot/bzImage"))
-	env := []string{
-		"SYZ_CMDLINE_FILE=" + osutil.Abs(cmdlineFile),
-		"SYZ_SYSCTL_FILE=" + osutil.Abs(sysctlFile),
-	}
-	_, err = osutil.RunCmdEnv(time.Hour, env, tempDir, scriptFile, userspaceDir, bzImage)
-	if err != nil {
+	cmd := osutil.Command(scriptFile, userspaceDir, bzImage)
+	cmd.Dir = tempDir
+	cmd.Env = append([]string{}, os.Environ()...)
+	cmd.Env = append(cmd.Env,
+		"SYZ_CMDLINE_FILE="+osutil.Abs(cmdlineFile),
+		"SYZ_SYSCTL_FILE="+osutil.Abs(sysctlFile),
+	)
+	if _, err = osutil.Run(time.Hour, cmd); err != nil {
 		return fmt.Errorf("image build failed: %v", err)
 	}
 	if err := osutil.CopyFile(filepath.Join(tempDir, "disk.raw"), image); err != nil {

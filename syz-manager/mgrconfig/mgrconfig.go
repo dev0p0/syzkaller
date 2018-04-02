@@ -13,26 +13,28 @@ import (
 	"github.com/google/syzkaller/pkg/config"
 	"github.com/google/syzkaller/pkg/osutil"
 	"github.com/google/syzkaller/prog"
-	_ "github.com/google/syzkaller/sys"
+	_ "github.com/google/syzkaller/sys" // most mgrconfig users want targets too
 	"github.com/google/syzkaller/vm"
 )
 
 type Config struct {
 	Name       string // Instance name (used for identification and as GCE instance prefix)
 	Target     string // Target OS/arch, e.g. "linux/arm64" or "linux/amd64/386" (amd64 OS with 386 test process)
-	Http       string // TCP address to serve HTTP stats page (e.g. "localhost:50000")
-	Rpc        string // TCP address to serve RPC for fuzzer processes (optional)
+	HTTP       string // TCP address to serve HTTP stats page (e.g. "localhost:50000")
+	RPC        string // TCP address to serve RPC for fuzzer processes (optional)
 	Workdir    string
 	Vmlinux    string
 	Kernel_Src string // kernel source directory
 	Tag        string // arbitrary optional tag that is saved along with crash reports (e.g. branch/commit)
 	Image      string // linux image for VMs
-	Sshkey     string // ssh key for the image (may be empty for some VM types)
-	Ssh_User   string // ssh user ("root" by default)
+	SSHKey     string // ssh key for the image (may be empty for some VM types)
+	SSH_User   string // ssh user ("root" by default)
 
 	Hub_Client string
 	Hub_Addr   string
 	Hub_Key    string
+
+	Email_Addrs []string // syz-manager will send crash emails to this list of emails using mailx (optional)
 
 	Dashboard_Client string
 	Dashboard_Addr   string
@@ -82,11 +84,11 @@ func LoadFile(filename string) (*Config, error) {
 
 func DefaultValues() *Config {
 	return &Config{
-		Ssh_User:  "root",
+		SSH_User:  "root",
 		Cover:     true,
 		Reproduce: true,
 		Sandbox:   "setuid",
-		Rpc:       ":0",
+		RPC:       ":0",
 		Procs:     1,
 	}
 }
@@ -109,16 +111,16 @@ func load(data []byte, filename string) (*Config, error) {
 		return nil, err
 	}
 
-	targetBin := func(name string) string {
+	targetBin := func(name, arch string) string {
 		exe := ""
 		if cfg.TargetOS == "windows" {
 			exe = ".exe"
 		}
-		return filepath.Join(cfg.Syzkaller, "bin", cfg.TargetOS+"_"+cfg.TargetVMArch, name+exe)
+		return filepath.Join(cfg.Syzkaller, "bin", cfg.TargetOS+"_"+arch, name+exe)
 	}
-	cfg.SyzFuzzerBin = targetBin("syz-fuzzer")
-	cfg.SyzExecprogBin = targetBin("syz-execprog")
-	cfg.SyzExecutorBin = targetBin("syz-executor")
+	cfg.SyzFuzzerBin = targetBin("syz-fuzzer", cfg.TargetVMArch)
+	cfg.SyzExecprogBin = targetBin("syz-execprog", cfg.TargetVMArch)
+	cfg.SyzExecutorBin = targetBin("syz-executor", cfg.TargetArch)
 	if !osutil.IsExist(cfg.SyzFuzzerBin) {
 		return nil, fmt.Errorf("bad config syzkaller param: can't find %v", cfg.SyzFuzzerBin)
 	}
@@ -128,7 +130,7 @@ func load(data []byte, filename string) (*Config, error) {
 	if !osutil.IsExist(cfg.SyzExecutorBin) {
 		return nil, fmt.Errorf("bad config syzkaller param: can't find %v", cfg.SyzExecutorBin)
 	}
-	if cfg.Http == "" {
+	if cfg.HTTP == "" {
 		return nil, fmt.Errorf("config param http is empty")
 	}
 	if cfg.Workdir == "" {
@@ -186,7 +188,7 @@ func SplitTarget(target string) (string, string, string, error) {
 	return os, vmarch, arch, nil
 }
 
-func ParseEnabledSyscalls(cfg *Config) (map[int]bool, error) {
+func ParseEnabledSyscalls(target *prog.Target, enabled, disabled []string) (map[int]bool, error) {
 	match := func(call *prog.Syscall, str string) bool {
 		if str == call.CallName || str == call.Name {
 			return true
@@ -197,14 +199,9 @@ func ParseEnabledSyscalls(cfg *Config) (map[int]bool, error) {
 		return false
 	}
 
-	target, err := prog.GetTarget(cfg.TargetOS, cfg.TargetArch)
-	if err != nil {
-		return nil, err
-	}
-
 	syscalls := make(map[int]bool)
-	if len(cfg.Enable_Syscalls) != 0 {
-		for _, c := range cfg.Enable_Syscalls {
+	if len(enabled) != 0 {
+		for _, c := range enabled {
 			n := 0
 			for _, call := range target.Syscalls {
 				if match(call, c) {
@@ -221,7 +218,7 @@ func ParseEnabledSyscalls(cfg *Config) (map[int]bool, error) {
 			syscalls[call.ID] = true
 		}
 	}
-	for _, c := range cfg.Disable_Syscalls {
+	for _, c := range disabled {
 		n := 0
 		for _, call := range target.Syscalls {
 			if match(call, c) {
@@ -238,6 +235,7 @@ func ParseEnabledSyscalls(cfg *Config) (map[int]bool, error) {
 
 func parseSuppressions(cfg *Config) error {
 	// Add some builtin suppressions.
+	// TODO(dvyukov): this should be moved to pkg/report.
 	supp := append(cfg.Suppressions, []string{
 		"panic: failed to start executor binary",
 		"panic: executor failed: pthread_create failed",
@@ -247,7 +245,12 @@ func parseSuppressions(cfg *Config) error {
 		"fatal error: unexpected signal during runtime execution", // presubmably OOM turned into SIGBUS
 		"signal SIGBUS: bus error",                                // presubmably OOM turned into SIGBUS
 		"Out of memory: Kill process .* \\(syz-fuzzer\\)",
+		"Out of memory: Kill process .* \\(sshd\\)",
+		"Killed process .* \\(syz-fuzzer\\)",
+		"Killed process .* \\(sshd\\)",
 		"lowmemorykiller: Killing 'syz-fuzzer'",
+		"lowmemorykiller: Killing 'sshd'",
+		"INIT: PANIC: segmentation violation!",
 	}...)
 	for _, s := range supp {
 		re, err := regexp.Compile(s)
@@ -273,8 +276,8 @@ func CreateVMEnv(cfg *Config, debug bool) *vm.Env {
 		Arch:    cfg.TargetVMArch,
 		Workdir: cfg.Workdir,
 		Image:   cfg.Image,
-		SshKey:  cfg.Sshkey,
-		SshUser: cfg.Ssh_User,
+		SSHKey:  cfg.SSHKey,
+		SSHUser: cfg.SSH_User,
 		Debug:   debug,
 		Config:  cfg.VM,
 	}

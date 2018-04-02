@@ -20,8 +20,8 @@ var (
 )
 
 type Config struct {
-	Http    string
-	Rpc     string
+	HTTP    string
+	RPC     string
 	Workdir string
 	Clients []struct {
 		Name string
@@ -55,9 +55,9 @@ func main() {
 		hub.keys[mgr.Name] = mgr.Key
 	}
 
-	hub.initHttp(cfg.Http)
+	hub.initHTTP(cfg.HTTP)
 
-	s, err := NewRpcServer(cfg.Rpc, hub)
+	s, err := NewRPCServer(cfg.RPC, hub)
 	if err != nil {
 		Fatalf("failed to create rpc server: %v", err)
 	}
@@ -117,7 +117,7 @@ func (hub *Hub) Sync(a *HubSyncArgs, r *HubSyncRes) error {
 }
 
 func (hub *Hub) auth(client, key, manager string) (string, error) {
-	if key, ok := hub.keys[client]; !ok || key != key {
+	if expectedKey, ok := hub.keys[client]; !ok || key != expectedKey {
 		Logf(0, "connect from unauthorized client %v", client)
 		return "", fmt.Errorf("unauthorized manager")
 	}

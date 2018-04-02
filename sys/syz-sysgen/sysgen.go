@@ -28,7 +28,6 @@ import (
 )
 
 var (
-	flagV          = flag.Int("v", 0, "verbosity")
 	flagMemProfile = flag.String("memprofile", "", "write a memory profile to the file")
 )
 
@@ -135,10 +134,12 @@ func generate(target *targets.Target, prg *compiler.Prog, consts map[string]uint
 	fmt.Fprintf(out, "import . \"github.com/google/syzkaller/prog\"\n\n")
 
 	fmt.Fprintf(out, "func init() {\n")
-	fmt.Fprintf(out, "\tRegisterTarget(&Target{OS: %q, Arch: %q, Revision: revision_%v, PtrSize: %v,"+
-		"Syscalls: syscalls_%v, Resources: resources_%v, Structs: structDescs_%v, Consts: consts_%v}, "+
+	fmt.Fprintf(out, "\tRegisterTarget(&Target{OS: %q, Arch: %q, Revision: revision_%v, PtrSize: %v, "+
+		"PageSize: %v, NumPages: %v, DataOffset: %v, Syscalls: syscalls_%v, "+
+		"Resources: resources_%v, Structs: structDescs_%v, Consts: consts_%v}, "+
 		"initTarget)\n",
 		target.OS, target.Arch, target.Arch, target.PtrSize,
+		target.PageSize, target.NumPages, target.DataOffset,
 		target.Arch, target.Arch, target.Arch, target.Arch)
 	fmt.Fprintf(out, "}\n\n")
 
@@ -174,42 +175,32 @@ func generateExecutorSyscalls(target *targets.Target, syscalls []*prog.Syscall, 
 		NeedCall bool
 	}
 	type ArchData struct {
-		Revision string
-		GOARCH   string
-		CARCH    []string
-		Calls    []SyscallData
-		Fake     []SyscallData
+		Revision   string
+		GOARCH     string
+		CARCH      []string
+		PageSize   uint64
+		NumPages   uint64
+		DataOffset uint64
+		Calls      []SyscallData
 	}
 	data := ArchData{
-		Revision: rev,
-		GOARCH:   target.Arch,
-		CARCH:    target.CArch,
+		Revision:   rev,
+		GOARCH:     target.Arch,
+		CARCH:      target.CArch,
+		PageSize:   target.PageSize,
+		NumPages:   target.NumPages,
+		DataOffset: target.DataOffset,
 	}
-	fake := make(map[string]uint64)
-	syscallNumbers := targets.OSList[target.OS].SyscallNumbers
 	for _, c := range syscalls {
-		syz := strings.HasPrefix(c.CallName, "syz_")
-		if syz {
-			fake[c.CallName] = c.NR
-		}
 		data.Calls = append(data.Calls, SyscallData{
 			Name:     c.Name,
 			CallName: c.CallName,
 			NR:       int32(c.NR),
-			NeedCall: syz || !syscallNumbers,
-		})
-	}
-	for name, nr := range fake {
-		data.Fake = append(data.Fake, SyscallData{
-			Name: name,
-			NR:   int32(nr),
+			NeedCall: !target.SyscallNumbers || strings.HasPrefix(c.CallName, "syz_"),
 		})
 	}
 	sort.Slice(data.Calls, func(i, j int) bool {
 		return data.Calls[i].Name < data.Calls[j].Name
-	})
-	sort.Slice(data.Fake, func(i, j int) bool {
-		return data.Fake[i].Name < data.Fake[j].Name
 	})
 	buf := new(bytes.Buffer)
 	if err := archTempl.Execute(buf, data); err != nil {
@@ -253,18 +244,13 @@ func failf(msg string, args ...interface{}) {
 	os.Exit(1)
 }
 
-func logf(v int, msg string, args ...interface{}) {
-	if *flagV >= v {
-		fmt.Fprintf(os.Stderr, msg+"\n", args...)
-	}
-}
-
 var archTempl = template.Must(template.New("").Parse(`
 #if {{range $cdef := $.CARCH}}defined({{$cdef}}) || {{end}}0
 #define GOARCH "{{.GOARCH}}"
 #define SYZ_REVISION "{{.Revision}}"
-{{range $c := $.Fake}}#define __NR_{{$c.Name}} {{$c.NR}}
-{{end}}
+#define SYZ_PAGE_SIZE {{.PageSize}}
+#define SYZ_NUM_PAGES {{.NumPages}}
+#define SYZ_DATA_OFFSET {{.DataOffset}}
 unsigned syscall_count = {{len $.Calls}};
 call_t syscalls[] = {
 {{range $c := $.Calls}}	{"{{$c.Name}}", {{$c.NR}}{{if $c.NeedCall}}, (syscall_t){{$c.CallName}}{{end}}},

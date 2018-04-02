@@ -35,11 +35,15 @@ func LoadData(data []byte, cfg interface{}) error {
 }
 
 func SaveFile(filename string, cfg interface{}) error {
-	data, err := json.MarshalIndent(cfg, "", "\t")
+	data, err := SaveData(cfg)
 	if err != nil {
 		return err
 	}
 	return osutil.WriteFile(filename, data)
+}
+
+func SaveData(cfg interface{}) ([]byte, error) {
+	return json.MarshalIndent(cfg, "", "\t")
 }
 
 func checkUnknownFields(data []byte, typ reflect.Type) error {
@@ -106,7 +110,7 @@ func checkUnknownFieldsStruct(val interface{}, prefix string, typ reflect.Type) 
 	}
 	inner, err := json.Marshal(val)
 	if err != nil {
-		return fmt.Errorf("failed to marshal inner struct '%v%v':", prefix, err)
+		return fmt.Errorf("failed to marshal inner struct %q: %v", prefix, err)
 	}
 	return checkUnknownFieldsRec(inner, prefix, typ)
 }

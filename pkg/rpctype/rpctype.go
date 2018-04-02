@@ -5,17 +5,21 @@
 // between various parts of the system.
 package rpctype
 
-type RpcInput struct {
-	Call      string
-	Prog      []byte
-	CallIndex int
-	Signal    []uint32
-	Cover     []uint32
+import (
+	"github.com/google/syzkaller/pkg/signal"
+)
+
+type RPCInput struct {
+	Call   string
+	Prog   []byte
+	Signal signal.Serial
+	Cover  []uint32
 }
 
-type RpcCandidate struct {
+type RPCCandidate struct {
 	Prog      []byte
 	Minimized bool
+	Smashed   bool
 }
 
 type ConnectArgs struct {
@@ -24,9 +28,9 @@ type ConnectArgs struct {
 
 type ConnectRes struct {
 	Prios        [][]float32
-	Inputs       []RpcInput
-	MaxSignal    []uint32
-	Candidates   []RpcCandidate
+	Inputs       []RPCInput
+	MaxSignal    signal.Serial
+	Candidates   []RPCCandidate
 	EnabledCalls string
 	NeedCheck    bool
 }
@@ -48,19 +52,20 @@ type CheckArgs struct {
 
 type NewInputArgs struct {
 	Name string
-	RpcInput
+	RPCInput
 }
 
 type PollArgs struct {
-	Name      string
-	MaxSignal []uint32
-	Stats     map[string]uint64
+	Name           string
+	NeedCandidates bool
+	MaxSignal      signal.Serial
+	Stats          map[string]uint64
 }
 
 type PollRes struct {
-	Candidates []RpcCandidate
-	NewInputs  []RpcInput
-	MaxSignal  []uint32
+	Candidates []RPCCandidate
+	NewInputs  []RPCInput
+	MaxSignal  signal.Serial
 }
 
 type HubConnectArgs struct {

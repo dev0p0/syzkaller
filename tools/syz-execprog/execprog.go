@@ -2,7 +2,7 @@
 // Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
 
 // execprog executes a single program or a set of programs
-// and optinally prints information about execution.
+// and optionally prints information about execution.
 package main
 
 import (
@@ -25,8 +25,8 @@ import (
 )
 
 var (
+	flagOS        = flag.String("os", runtime.GOOS, "target os")
 	flagArch      = flag.String("arch", runtime.GOARCH, "target arch")
-	flagExecutor  = flag.String("executor", "./syz-executor", "path to executor binary")
 	flagCoverFile = flag.String("coverfile", "", "write coverage to the file")
 	flagRepeat    = flag.Int("repeat", 1, "repeat execution that many times (0 for infinite loop)")
 	flagProcs     = flag.Int("procs", 1, "number of parallel processes to execute programs")
@@ -44,36 +44,31 @@ func main() {
 		os.Exit(1)
 	}
 
-	target, err := prog.GetTarget(runtime.GOOS, *flagArch)
+	target, err := prog.GetTarget(*flagOS, *flagArch)
 	if err != nil {
 		Fatalf("%v", err)
 	}
 
-	var progs []*prog.Prog
+	var entries []*prog.LogEntry
 	for _, fn := range flag.Args() {
 		data, err := ioutil.ReadFile(fn)
 		if err != nil {
 			Fatalf("failed to read log file: %v", err)
 		}
-		entries := target.ParseLog(data)
-		for _, ent := range entries {
-			progs = append(progs, ent.P)
-		}
+		entries = append(entries, target.ParseLog(data)...)
 	}
-	Logf(0, "parsed %v programs", len(progs))
-	if len(progs) == 0 {
+	Logf(0, "parsed %v programs", len(entries))
+	if len(entries) == 0 {
 		return
 	}
 
-	execOpts := &ipc.ExecOpts{}
-	config, err := ipc.DefaultConfig()
+	config, execOpts, err := ipc.DefaultConfig()
 	if err != nil {
 		Fatalf("%v", err)
 	}
 	if config.Flags&ipc.FlagSignal != 0 {
 		execOpts.Flags |= ipc.FlagCollectCover
 	}
-	execOpts.Flags |= ipc.FlagDedupCover
 	if *flagCoverFile != "" {
 		config.Flags |= ipc.FlagSignal
 		execOpts.Flags |= ipc.FlagCollectCover
@@ -94,8 +89,8 @@ func main() {
 	}
 
 	handled := make(map[string]bool)
-	for _, prog := range progs {
-		for _, call := range prog.Calls {
+	for _, entry := range entries {
+		for _, call := range entry.P.Calls {
 			handled[call.Meta.CallName] = true
 		}
 	}
@@ -114,7 +109,7 @@ func main() {
 		pid := p
 		go func() {
 			defer wg.Done()
-			env, err := ipc.MakeEnv(*flagExecutor, pid, config)
+			env, err := ipc.MakeEnv(config, pid)
 			if err != nil {
 				Fatalf("failed to create ipc env: %v", err)
 			}
@@ -128,23 +123,35 @@ func main() {
 					posMu.Lock()
 					idx := pos
 					pos++
-					if idx%len(progs) == 0 && time.Since(lastPrint) > 5*time.Second {
+					if idx%len(entries) == 0 && time.Since(lastPrint) > 5*time.Second {
 						Logf(0, "executed programs: %v", idx)
 						lastPrint = time.Now()
 					}
 					posMu.Unlock()
-					if *flagRepeat > 0 && idx >= len(progs)**flagRepeat {
+					if *flagRepeat > 0 && idx >= len(entries)**flagRepeat {
 						return false
 					}
-					p := progs[idx%len(progs)]
+					entry := entries[idx%len(entries)]
+					callOpts := execOpts
+					if *flagFaultCall == -1 && entry.Fault {
+						newOpts := *execOpts
+						newOpts.Flags |= ipc.FlagInjectFault
+						newOpts.FaultCall = entry.FaultCall
+						newOpts.FaultNth = entry.FaultNth
+						callOpts = &newOpts
+					}
 					switch *flagOutput {
 					case "stdout":
-						data := p.Serialize()
+						strOpts := ""
+						if callOpts.Flags&ipc.FlagInjectFault != 0 {
+							strOpts = fmt.Sprintf(" (fault-call:%v fault-nth:%v)", callOpts.FaultCall, callOpts.FaultNth)
+						}
+						data := entry.P.Serialize()
 						logMu.Lock()
-						Logf(0, "executing program %v:\n%s", pid, data)
+						Logf(0, "executing program %v%v:\n%s", pid, strOpts, data)
 						logMu.Unlock()
 					}
-					output, info, failed, hanged, err := env.Exec(execOpts, p)
+					output, info, failed, hanged, err := env.Exec(callOpts, entry.P)
 					select {
 					case <-shutdown:
 						return false
@@ -155,6 +162,11 @@ func main() {
 					}
 					if config.Flags&ipc.FlagDebug != 0 || err != nil {
 						fmt.Printf("result: failed=%v hanged=%v err=%v\n\n%s", failed, hanged, err, output)
+					}
+					if len(info) != 0 {
+						fmt.Printf("RESULT: signal %v, coverage %v errno %v\n", len(info[0].Signal), len(info[0].Cover), info[0].Errno)
+					} else {
+						fmt.Printf("RESULT: no calls executed\n")
 					}
 					if *flagCoverFile != "" {
 						// Coverage is dumped in sanitizer format.
@@ -177,12 +189,31 @@ func main() {
 						}
 					}
 					if *flagHints {
-						compMaps := ipc.GetCompMaps(info)
-						p.MutateWithHints(compMaps, func(p *prog.Prog) {
-							fmt.Printf("%v\n", string(p.Serialize()))
-						})
+						ncomps, ncandidates := 0, 0
+						for i := range entry.P.Calls {
+							if *flagOutput == "stdout" {
+								fmt.Printf("call %v:\n", i)
+							}
+							comps := info[i].Comps
+							for v, args := range comps {
+								ncomps += len(args)
+								if *flagOutput == "stdout" {
+									fmt.Printf("comp 0x%x:", v)
+									for arg := range args {
+										fmt.Printf(" 0x%x", arg)
+									}
+									fmt.Printf("\n")
+								}
+							}
+							entry.P.MutateWithHints(i, comps, func(p *prog.Prog) {
+								ncandidates++
+								if *flagOutput == "stdout" {
+									fmt.Printf("PROGRAM:\n%s\n", p.Serialize())
+								}
+							})
+						}
+						fmt.Printf("ncomps=%v ncandidates=%v\n", ncomps, ncandidates)
 					}
-
 					return true
 				}() {
 					return

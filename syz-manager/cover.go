@@ -10,13 +10,16 @@ import (
 	"html/template"
 	"io"
 	"io/ioutil"
-	"os/exec"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/google/syzkaller/pkg/cover"
+	"github.com/google/syzkaller/pkg/hash"
 	. "github.com/google/syzkaller/pkg/log"
+	"github.com/google/syzkaller/pkg/osutil"
 	"github.com/google/syzkaller/pkg/symbolizer"
 )
 
@@ -88,25 +91,25 @@ func initAllCover(vmlinux string) {
 	}()
 }
 
-func generateCoverHtml(w io.Writer, vmlinux string, cov []uint32) error {
+func generateCoverHTML(w io.Writer, vmlinux string, cov cover.Cover) error {
 	if len(cov) == 0 {
 		return fmt.Errorf("No coverage data available")
 	}
 
-	base, err := getVmOffset(vmlinux)
+	base, err := getVMOffset(vmlinux)
 	if err != nil {
 		return err
 	}
-	pcs := make([]uint64, len(cov))
-	for i, pc := range cov {
-		pcs[i] = cover.RestorePC(pc, base) - callLen
+	pcs := make([]uint64, 0, len(cov))
+	for pc := range cov {
+		pcs = append(pcs, cover.RestorePC(pc, base)-callLen)
 	}
 	uncovered, err := uncoveredPcsInFuncs(vmlinux, pcs)
 	if err != nil {
 		return err
 	}
 
-	coveredFrames, prefix, err := symbolize(vmlinux, pcs)
+	coveredFrames, _, err := symbolize(vmlinux, pcs)
 	if err != nil {
 		return err
 	}
@@ -145,10 +148,9 @@ func generateCoverHtml(w io.Writer, vmlinux string, cov []uint32) error {
 				buf.Write([]byte{'\n'})
 			}
 		}
-		if len(f) > len(prefix) {
-			f = f[len(prefix):]
-		}
+		f = filepath.Clean(strings.TrimPrefix(f, prefix))
 		d.Files = append(d.Files, &templateFile{
+			ID:       hash.String([]byte(f)),
 			Name:     f,
 			Body:     template.HTML(buf.String()),
 			Coverage: coverage,
@@ -156,10 +158,7 @@ func generateCoverHtml(w io.Writer, vmlinux string, cov []uint32) error {
 	}
 
 	sort.Sort(templateFileArray(d.Files))
-	if err := coverTemplate.Execute(w, d); err != nil {
-		return err
-	}
-	return nil
+	return coverTemplate.Execute(w, d)
 }
 
 func fileSet(covered, uncovered []symbolizer.Frame) map[string][]coverage {
@@ -216,13 +215,13 @@ func parseFile(fn string) ([][]byte, error) {
 	return lines, nil
 }
 
-func getVmOffset(vmlinux string) (uint32, error) {
+func getVMOffset(vmlinux string) (uint32, error) {
 	if v, ok := vmOffsets[vmlinux]; ok {
 		return v, nil
 	}
-	out, err := exec.Command("readelf", "-SW", vmlinux).CombinedOutput()
+	out, err := osutil.RunCmd(time.Hour, "", "readelf", "-SW", vmlinux)
 	if err != nil {
-		return 0, fmt.Errorf("readelf failed: %v\n%s", err, out)
+		return 0, err
 	}
 	s := bufio.NewScanner(bytes.NewReader(out))
 	var addr uint32
@@ -308,7 +307,7 @@ func uncoveredPcsInFuncs(vmlinux string, pcs []uint64) ([]uint64, error) {
 
 // coveredPCs returns list of PCs of __sanitizer_cov_trace_pc calls in binary bin.
 func coveredPCs(bin string) ([]uint64, error) {
-	cmd := exec.Command("objdump", "-d", "--no-show-raw-insn", bin)
+	cmd := osutil.Command("objdump", "-d", "--no-show-raw-insn", bin)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return nil, err
@@ -327,7 +326,7 @@ func coveredPCs(bin string) ([]uint64, error) {
 		ln := s.Bytes()
 		if pos := bytes.Index(ln, callInsn); pos == -1 {
 			continue
-		} else if bytes.Index(ln[pos:], traceFunc) == -1 {
+		} else if !bytes.Contains(ln[pos:], traceFunc) {
 			continue
 		}
 		colon := bytes.IndexByte(ln, ':')
@@ -380,6 +379,7 @@ type templateData struct {
 }
 
 type templateFile struct {
+	ID       string
 	Name     string
 	Body     template.HTML
 	Coverage int
@@ -404,8 +404,7 @@ func (a templateFileArray) Less(i, j int) bool {
 }
 func (a templateFileArray) Swap(i, j int) { a[i], a[j] = a[j], a[i] }
 
-var coverTemplate = template.Must(template.New("").Parse(
-	`
+var coverTemplate = template.Must(template.New("").Parse(`
 <!DOCTYPE html>
 <html>
 	<head>
@@ -445,28 +444,40 @@ var coverTemplate = template.Must(template.New("").Parse(
 		<div id="topbar">
 			<div id="nav">
 				<select id="files">
-				{{range $i, $f := .Files}}
-				<option value="file{{$i}}">{{$f.Name}} ({{$f.Coverage}})</option>
+				{{range $f := .Files}}
+				<option value="{{$f.ID}}">{{$f.Name}} ({{$f.Coverage}})</option>
 				{{end}}
 				</select>
 			</div>
 		</div>
 		<div id="content">
 		{{range $i, $f := .Files}}
-		<pre class="file" id="file{{$i}}" {{if $i}}style="display: none"{{end}}>{{$f.Body}}</pre>
-		{{end}}
+		<pre class="file" id="{{$f.ID}}" {{if $i}}style="display: none;"{{end}}>{{$f.Body}}</pre>{{end}}
 		</div>
 	</body>
 	<script>
 	(function() {
 		var files = document.getElementById('files');
-		var visible = document.getElementById('file0');
+		var visible = document.getElementById(files.value);
+		if (window.location.hash) {
+			var hash = window.location.hash.substring(1);
+			for (var i = 0; i < files.options.length; i++) {
+				if (files.options[i].value === hash) {
+					files.selectedIndex = i;
+					visible.style.display = 'none';
+					visible = document.getElementById(files.value);
+					visible.style.display = 'block';
+					break;
+				}
+			}
+		}
 		files.addEventListener('change', onChange, false);
 		function onChange() {
 			visible.style.display = 'none';
 			visible = document.getElementById(files.value);
 			visible.style.display = 'block';
 			window.scrollTo(0, 0);
+			window.location.hash = files.value;
 		}
 	})();
 	</script>

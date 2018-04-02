@@ -7,7 +7,7 @@
 #
 # Prerequisites:
 # - you need a user-space system, a basic Debian system can be created with:
-#   sudo debootstrap --include=openssh-server,curl,tar,time,strace stable debian
+#   sudo debootstrap --include=openssh-server,curl,tar,gcc,libc6-dev,time,strace,sudo,less,psmisc,selinux-utils,policycoreutils,checkpolicy,selinux-policy-default stable debian
 # - you need qemu-nbd, grub and maybe something else:
 #   sudo apt-get install qemu-utils grub-efi
 # - you need nbd support in kernel
@@ -76,6 +76,14 @@ sudo sed -i "/^root/ { s/:x:/::/ }" disk.mnt/etc/passwd
 echo "T0:23:respawn:/sbin/getty -L ttyS0 115200 vt100" | sudo tee -a disk.mnt/etc/inittab
 echo -en "auto lo\niface lo inet loopback\nauto eth0\niface eth0 inet dhcp\n" | sudo tee disk.mnt/etc/network/interfaces
 echo "debugfs /sys/kernel/debug debugfs defaults 0 0" | sudo tee -a disk.mnt/etc/fstab
+echo 'binfmt_misc /proc/sys/fs/binfmt_misc binfmt_misc defaults 0 0' | sudo tee -a disk.mnt/etc/fstab
+for i in {0..31}; do
+	echo "KERNEL==\"binder$i\", NAME=\"binder$i\", MODE=\"0666\"" | \
+		tee -a disk.mnt/etc/udev/50-binder.rules
+done
+# We disable selinux for now because the default policy on wheezy prevents
+# mounting of cgroup2 (and stretch we don't know how to configure yet).
+echo 'SELINUX=disabled' | sudo tee disk.mnt/etc/selinux/config
 
 # sysctls
 echo "kernel.printk = 7 4 1 3" | sudo tee -a disk.mnt/etc/sysctl.conf

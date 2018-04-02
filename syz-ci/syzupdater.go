@@ -35,6 +35,7 @@ type SyzUpdater struct {
 	repo         string
 	branch       string
 	descriptions string
+	gopathDir    string
 	syzkallerDir string
 	latestDir    string
 	currentDir   string
@@ -58,7 +59,6 @@ func NewSyzUpdater(cfg *Config) *SyzUpdater {
 	}
 
 	gopath := filepath.Join(wd, "gopath")
-	os.Setenv("GOPATH", gopath)
 	os.Setenv("GOROOT", cfg.Goroot)
 	os.Setenv("PATH", filepath.Join(cfg.Goroot, "bin")+
 		string(filepath.ListSeparator)+os.Getenv("PATH"))
@@ -96,6 +96,7 @@ func NewSyzUpdater(cfg *Config) *SyzUpdater {
 		repo:         cfg.Syzkaller_Repo,
 		branch:       cfg.Syzkaller_Branch,
 		descriptions: cfg.Syzkaller_Descriptions,
+		gopathDir:    gopath,
 		syzkallerDir: syzkallerDir,
 		latestDir:    filepath.Join("syzkaller", "latest"),
 		currentDir:   filepath.Join("syzkaller", "current"),
@@ -111,7 +112,7 @@ func (upd *SyzUpdater) UpdateOnStart(shutdown chan struct{}) {
 	os.RemoveAll(upd.currentDir)
 	exeTag, exeMod := readTag(upd.exe + ".tag")
 	latestTag := upd.checkLatest()
-	if exeTag == latestTag && time.Since(exeMod) < syzkallerRebuildPeriod/2 {
+	if exeTag == latestTag && time.Since(exeMod) < time.Minute {
 		// Have a freash up-to-date build, probably just restarted.
 		Logf(0, "current executable is up-to-date (%v)", exeTag)
 		if err := osutil.LinkFiles(upd.latestDir, upd.currentDir, upd.syzFiles); err != nil {
@@ -193,10 +194,10 @@ func (upd *SyzUpdater) pollAndBuild(lastCommit string) string {
 	if err != nil {
 		Logf(0, "syzkaller: failed to poll: %v", err)
 	} else {
-		Logf(0, "syzkaller: poll: %v", commit)
-		if lastCommit != commit {
+		Logf(0, "syzkaller: poll: %v (%v)", commit.Hash, commit.Title)
+		if lastCommit != commit.Hash {
 			Logf(0, "syzkaller: building ...")
-			lastCommit = commit
+			lastCommit = commit.Hash
 			if err := upd.build(); err != nil {
 				Logf(0, "syzkaller: %v", err)
 			}
@@ -223,28 +224,41 @@ func (upd *SyzUpdater) build() error {
 			}
 		}
 	}
-	if _, err := osutil.RunCmd(time.Hour, upd.syzkallerDir, "make", "generate"); err != nil {
+	cmd := osutil.Command("make", "generate")
+	cmd.Dir = upd.syzkallerDir
+	cmd.Env = append([]string{"GOPATH=" + upd.gopathDir}, os.Environ()...)
+	if _, err := osutil.Run(time.Hour, cmd); err != nil {
 		return fmt.Errorf("build failed: %v", err)
 	}
-	if _, err := osutil.RunCmd(time.Hour, upd.syzkallerDir, "make", "host", "ci"); err != nil {
+	cmd = osutil.Command("make", "host", "ci")
+	cmd.Dir = upd.syzkallerDir
+	cmd.Env = append([]string{"GOPATH=" + upd.gopathDir}, os.Environ()...)
+	if _, err := osutil.Run(time.Hour, cmd); err != nil {
 		return fmt.Errorf("build failed: %v", err)
 	}
 	for target := range upd.targets {
 		parts := strings.Split(target, "/")
-		env := []string{
-			"TARGETOS=" + parts[0],
-			"TARGETVMARCH=" + parts[1],
-			"TARGETARCH=" + parts[2],
-		}
-		if _, err := osutil.RunCmdEnv(time.Hour, env, upd.syzkallerDir, "make", "target"); err != nil {
+		cmd := osutil.Command("make", "target")
+		cmd.Dir = upd.syzkallerDir
+		cmd.Env = append([]string{}, os.Environ()...)
+		cmd.Env = append(cmd.Env,
+			"GOPATH="+upd.gopathDir,
+			"TARGETOS="+parts[0],
+			"TARGETVMARCH="+parts[1],
+			"TARGETARCH="+parts[2],
+		)
+		if _, err := osutil.Run(time.Hour, cmd); err != nil {
 			return fmt.Errorf("build failed: %v", err)
 		}
 	}
-	if _, err := osutil.RunCmd(time.Hour, upd.syzkallerDir, "go", "test", "-short", "./..."); err != nil {
+	cmd = osutil.Command("go", "test", "-short", "./...")
+	cmd.Dir = upd.syzkallerDir
+	cmd.Env = append([]string{"GOPATH=" + upd.gopathDir}, os.Environ()...)
+	if _, err := osutil.Run(time.Hour, cmd); err != nil {
 		return fmt.Errorf("tests failed: %v", err)
 	}
 	tagFile := filepath.Join(upd.syzkallerDir, "tag")
-	if err := osutil.WriteFile(tagFile, []byte(commit)); err != nil {
+	if err := osutil.WriteFile(tagFile, []byte(commit.Hash)); err != nil {
 		return fmt.Errorf("filed to write tag file: %v", err)
 	}
 	if err := osutil.CopyFiles(upd.syzkallerDir, upd.latestDir, upd.syzFiles); err != nil {

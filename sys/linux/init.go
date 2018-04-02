@@ -32,17 +32,28 @@ func initTarget(target *prog.Target) {
 		FITHAW:                    target.ConstMap["FITHAW"],
 		PTRACE_TRACEME:            target.ConstMap["PTRACE_TRACEME"],
 		CLOCK_REALTIME:            target.ConstMap["CLOCK_REALTIME"],
+		ARCH_SET_FS:               target.ConstMap["ARCH_SET_FS"],
+		ARCH_SET_GS:               target.ConstMap["ARCH_SET_GS"],
+		AF_NFC:                    target.ConstMap["AF_NFC"],
+		AF_LLC:                    target.ConstMap["AF_LLC"],
+		AF_BLUETOOTH:              target.ConstMap["AF_BLUETOOTH"],
 	}
 
-	target.PageSize = pageSize
-	target.DataOffset = dataOffset
-	target.MmapSyscall = arch.mmapSyscall
 	target.MakeMmap = arch.makeMmap
-	target.AnalyzeMmap = arch.analyzeMmap
 	target.SanitizeCall = arch.sanitizeCall
-	target.SpecialStructs = map[string]func(g *prog.Gen, typ *prog.StructType, old *prog.GroupArg) (prog.Arg, []*prog.Call){
-		"timespec": arch.generateTimespec,
-		"timeval":  arch.generateTimespec,
+	target.SpecialTypes = map[string]func(g *prog.Gen, typ prog.Type, old prog.Arg) (
+		prog.Arg, []*prog.Call){
+		"timespec":           arch.generateTimespec,
+		"timeval":            arch.generateTimespec,
+		"sockaddr_alg":       arch.generateSockaddrAlg,
+		"alg_name":           arch.generateAlgName,
+		"alg_aead_name":      arch.generateAlgAeadName,
+		"alg_hash_name":      arch.generateAlgHashName,
+		"alg_blkcipher_name": arch.generateAlgBlkcipherhName,
+		"ipt_replace":        arch.generateIptables,
+		"ip6t_replace":       arch.generateIptables,
+		"arpt_replace":       arch.generateArptables,
+		"ebt_replace":        arch.generateEbtables,
 	}
 	target.StringDictionary = stringDictionary
 
@@ -54,9 +65,7 @@ func initTarget(target *prog.Target) {
 }
 
 const (
-	pageSize   = 4 << 10
-	dataOffset = 512 << 20
-	invalidFD  = ^uint64(0)
+	invalidFD = ^uint64(0)
 )
 
 var (
@@ -65,6 +74,7 @@ var (
 	KCOV_ENABLE     uintptr
 	KCOV_TRACE_CMP  uintptr
 
+	// TODO(dvyukov): get rid of this, this must be in descriptions.
 	stringDictionary = []string{"user", "keyring", "trusted", "system", "security", "selinux",
 		"posix_acl_access", "mime_type", "md5sum", "nodev", "self",
 		"bdev", "proc", "cgroup", "cpuset",
@@ -95,53 +105,27 @@ type arch struct {
 	FITHAW                    uint64
 	PTRACE_TRACEME            uint64
 	CLOCK_REALTIME            uint64
+	ARCH_SET_FS               uint64
+	ARCH_SET_GS               uint64
+	AF_NFC                    uint64
+	AF_LLC                    uint64
+	AF_BLUETOOTH              uint64
 }
 
-// createMmapCall creates a "normal" mmap call that maps [start, start+npages) page range.
-func (arch *arch) makeMmap(start, npages uint64) *prog.Call {
+// createMmapCall creates a "normal" mmap call that maps [addr, addr+size) memory range.
+func (arch *arch) makeMmap(addr, size uint64) *prog.Call {
 	meta := arch.mmapSyscall
 	return &prog.Call{
 		Meta: meta,
 		Args: []prog.Arg{
-			prog.MakePointerArg(meta.Args[0], start, 0, npages, nil),
-			prog.MakeConstArg(meta.Args[1], npages*pageSize),
+			prog.MakeVmaPointerArg(meta.Args[0], addr, size),
+			prog.MakeConstArg(meta.Args[1], size),
 			prog.MakeConstArg(meta.Args[2], arch.PROT_READ|arch.PROT_WRITE),
 			prog.MakeConstArg(meta.Args[3], arch.MAP_ANONYMOUS|arch.MAP_PRIVATE|arch.MAP_FIXED),
 			prog.MakeResultArg(meta.Args[4], nil, invalidFD),
 			prog.MakeConstArg(meta.Args[5], 0),
 		},
 		Ret: prog.MakeReturnArg(meta.Ret),
-	}
-}
-
-func (arch *arch) analyzeMmap(c *prog.Call) (start, npages uint64, mapped bool) {
-	switch c.Meta.Name {
-	case "mmap":
-		// Filter out only very wrong arguments.
-		npages = c.Args[1].(*prog.ConstArg).Val / pageSize
-		if npages == 0 {
-			return
-		}
-		flags := c.Args[3].(*prog.ConstArg).Val
-		fd := c.Args[4].(*prog.ResultArg).Val
-		if flags&arch.MAP_ANONYMOUS == 0 && fd == invalidFD {
-			return
-		}
-		start = c.Args[0].(*prog.PointerArg).PageIndex
-		mapped = true
-		return
-	case "munmap":
-		start = c.Args[0].(*prog.PointerArg).PageIndex
-		npages = c.Args[1].(*prog.ConstArg).Val / pageSize
-		mapped = false
-		return
-	case "mremap":
-		start = c.Args[4].(*prog.PointerArg).PageIndex
-		npages = c.Args[2].(*prog.ConstArg).Val / pageSize
-		mapped = true
-		return
-	default:
-		return
 	}
 }
 
@@ -161,17 +145,17 @@ func (arch *arch) sanitizeCall(c *prog.Call) {
 		if c.Meta.CallName == "mknodat" {
 			pos = 2
 		}
+		if _, ok := c.Args[pos+1].Type().(*prog.ProcType); ok {
+			return
+		}
 		mode := c.Args[pos].(*prog.ConstArg)
 		dev := c.Args[pos+1].(*prog.ConstArg)
+		dev.Val = uint64(uint32(dev.Val))
 		// Char and block devices read/write io ports, kernel memory and do other nasty things.
 		// TODO: not required if executor drops privileges.
 		switch mode.Val & (arch.S_IFREG | arch.S_IFCHR | arch.S_IFBLK | arch.S_IFIFO | arch.S_IFSOCK) {
 		case arch.S_IFREG, arch.S_IFIFO, arch.S_IFSOCK:
 		case arch.S_IFBLK:
-			// TODO(dvyukov): mknod dev argument is uint32,
-			// but prog arguments contain not-truncated uint64 values,
-			// so we can mistakenly assume that this is not loop, when it actually is.
-			// This is not very harmful, but need to verify other arguments in this function.
 			if dev.Val>>8 == 7 {
 				break // loop
 			}
@@ -183,6 +167,7 @@ func (arch *arch) sanitizeCall(c *prog.Call) {
 		}
 	case "syslog":
 		cmd := c.Args[0].(*prog.ConstArg)
+		cmd.Val = uint64(uint32(cmd.Val))
 		// These disable console output, but we need it.
 		if cmd.Val == arch.SYSLOG_ACTION_CONSOLE_OFF || cmd.Val == arch.SYSLOG_ACTION_CONSOLE_ON {
 			cmd.Val = arch.SYSLOG_ACTION_SIZE_UNREAD
@@ -208,10 +193,32 @@ func (arch *arch) sanitizeCall(c *prog.Call) {
 		if code.Val%128 == 67 || code.Val%128 == 68 {
 			code.Val = 1
 		}
+	case "arch_prctl":
+		// fs holds address of tls, if a program messes it at least signal
+		// handling will break. This also allows a program to do writes
+		// at arbitrary addresses, which usually leads to machine outbreak.
+		cmd := c.Args[0].(*prog.ConstArg)
+		if uint64(uint32(cmd.Val)) == arch.ARCH_SET_FS {
+			cmd.Val = arch.ARCH_SET_GS
+		}
+	case "syz_init_net_socket":
+		// Don't let it mess with arbitrary sockets in init namespace.
+		family := c.Args[0].(*prog.ConstArg)
+		switch uint64(uint32(family.Val)) {
+		case arch.AF_NFC, arch.AF_LLC, arch.AF_BLUETOOTH:
+		default:
+			family.Val = ^uint64(0)
+		}
+	}
+
+	switch c.Meta.Name {
+	case "setsockopt$EBT_SO_SET_ENTRIES":
+		arch.sanitizeEbtables(c)
 	}
 }
 
-func (arch *arch) generateTimespec(g *prog.Gen, typ *prog.StructType, old *prog.GroupArg) (arg prog.Arg, calls []*prog.Call) {
+func (arch *arch) generateTimespec(g *prog.Gen, typ0 prog.Type, old prog.Arg) (arg prog.Arg, calls []*prog.Call) {
+	typ := typ0.(*prog.StructType)
 	// We need to generate timespec/timeval that are either
 	// (1) definitely in the past, or
 	// (2) definitely in unreachable fututre, or
@@ -266,17 +273,17 @@ func (arch *arch) generateTimespec(g *prog.Gen, typ *prog.StructType, old *prog.
 			Ret: prog.MakeReturnArg(meta.Ret),
 		}
 		calls = append(calls, gettime)
-		sec := prog.MakeResultArg(typ.Fields[0], tp.(*prog.GroupArg).Inner[0], 0)
-		nsec := prog.MakeResultArg(typ.Fields[1], tp.(*prog.GroupArg).Inner[1], 0)
+		sec := prog.MakeResultArg(typ.Fields[0], tp.Inner[0], 0)
+		nsec := prog.MakeResultArg(typ.Fields[1], tp.Inner[1], 0)
 		msec := uint64(10)
 		if g.NOutOf(1, 2) {
 			msec = 30
 		}
 		if usec {
-			nsec.(*prog.ResultArg).OpDiv = 1e3
-			nsec.(*prog.ResultArg).OpAdd = msec * 1e3
+			nsec.OpDiv = 1e3
+			nsec.OpAdd = msec * 1e3
 		} else {
-			nsec.(*prog.ResultArg).OpAdd = msec * 1e6
+			nsec.OpAdd = msec * 1e6
 		}
 		arg = prog.MakeGroupArg(typ, []prog.Arg{sec, nsec})
 	}

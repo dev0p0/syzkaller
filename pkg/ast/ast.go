@@ -20,6 +20,11 @@ type Description struct {
 // Node is AST node interface.
 type Node interface {
 	Info() (pos Pos, typ string, name string)
+	// Clone makes a deep copy of the node.
+	Clone() Node
+	// Walk calls callback cb for all child nodes of this node.
+	// Note: it's not recursive. Use Recursive helper for recursive walk.
+	Walk(cb func(Node))
 }
 
 // Top-level AST nodes:
@@ -97,7 +102,7 @@ type Struct struct {
 	Pos      Pos
 	Name     *Ident
 	Fields   []*Field
-	Attrs    []*Ident
+	Attrs    []*Type
 	Comments []*Comment
 	IsUnion  bool
 }
@@ -128,6 +133,20 @@ type StrFlags struct {
 
 func (n *StrFlags) Info() (Pos, string, string) {
 	return n.Pos, "string flags", n.Name.Name
+}
+
+type TypeDef struct {
+	Pos  Pos
+	Name *Ident
+	// Non-template type aliases have only Type filled.
+	// Templates have Args and either Type or Struct filled.
+	Args   []*Ident
+	Type   *Type
+	Struct *Struct
+}
+
+func (n *TypeDef) Info() (Pos, string, string) {
+	return n.Pos, "type", n.Name.Name
 }
 
 // Not top-level AST nodes:
@@ -166,10 +185,11 @@ func (n *Int) Info() (Pos, string, string) {
 type Type struct {
 	Pos Pos
 	// Only one of Value, Ident, String is filled.
-	Value    uint64
-	ValueHex bool
-	Ident    string
-	String   string
+	Value     uint64
+	ValueHex  bool
+	Ident     string
+	String    string
+	HasString bool
 	// Part after COLON (for ranges and bitfields).
 	HasColon  bool
 	Pos2      Pos

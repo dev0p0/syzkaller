@@ -9,7 +9,7 @@ argname = identifier
 type = typename [ "[" type-options "]" ]
 typename = "const" | "intN" | "intptr" | "flags" | "array" | "ptr" |
 	   "buffer" | "string" | "strconst" | "filename" | "len" |
-	   "bytesize" | "vma" | "proc"
+	   "bytesize" | "bytesizeN" | "bitsize" | "vma" | "proc"
 type-options = [type-opt ["," type-opt]]
 ```
 
@@ -37,13 +37,17 @@ rest of the type-options are type-specific:
 	direction (in/out/inout)
 "string": a zero-terminated memory buffer (no pointer indirection implied), type-options:
 	either a string value in quotes for constant strings (e.g. "foo"),
-	or a reference to string flags,
+	or a reference to string flags (special value `filename` produces file names),
 	optionally followed by a buffer size (string values will be padded with \x00 to that size)
-"filename": a file/link/dir name, no pointer indirection implied, in most cases you want `ptr[in, filename]`
+"stringnoz": a non-zero-terminated memory buffer (no pointer indirection implied), type-options:
+	either a string value in quotes for constant strings (e.g. "foo"),
+	or a reference to string flags,
 "fileoff": offset within a file
 "len": length of another field (for array it is number of elements), type-options:
 	argname of the object
 "bytesize": similar to "len", but always denotes the size in bytes, type-options:
+	argname of the object
+"bitsize": similar to "len", but always denotes the size in bits, type-options:
 	argname of the object
 "vma": a pointer to a set of pages (used as input for mmap/munmap/mremap/madvise), type-options:
 	optional number of pages (e.g. vma[7]), or a range of pages (e.g. vma[2-4])
@@ -51,6 +55,8 @@ rest of the type-options are type-specific:
 	value range start, how many values per process, underlying type
 "text": machine code of the specified type, type-options:
 	text type (x86_real, x86_16, x86_32, x86_64, arm64)
+"void": type with static size 0
+	mostly useful inside of templates and varlen unions, can't be syscall argument
 ```
 
 flags/len/flags also have trailing underlying type type-option when used in structs/unions/pointers.
@@ -95,10 +101,19 @@ Structs are described as:
 ```
 structname "{" "\n"
 	(fieldname type "\n")+
-"}"
+"}" ("[" attribute* "]")?
 ```
 
-Structs can have trailing attributes `packed` and `align_N`, they are specified in square brackets after the struct.
+Structs can have attributes specified in square brackets after the struct.
+Attributes are:
+
+```
+"packed": the struct does not have paddings and has default alignment 1
+"align_N": the struct has alignment N
+"size": the struct is padded up to the specified size
+```
+
+attribute
 
 ## Unions
 
@@ -135,9 +150,64 @@ accept(fd sock, ...) sock
 listen(fd sock, backlog int32)
 ```
 
+## Type Aliases
+
+Complex types that are often repeated can be given short type aliases using the
+following syntax:
+
+```
+type identifier underlying_type
+```
+
+For example:
+
+```
+type signalno int32[0:65]
+type net_port proc[20000, 4, int16be]
+```
+
+Then, type alias can be used instead of the underlying type in any contexts.
+Underlying type needs to be described as if it's a struct field, that is,
+with the base type if it's required. However, type alias can be used as syscall
+arguments as well. Underlying types are currently restricted to integer types,
+`ptr`, `ptr64`, `const`, `flags` and `proc` types.
+
+There are some builtin type aliases:
+```
+type bool8	int8[0:1]
+type bool16	int16[0:1]
+type bool32	int32[0:1]
+type bool64	int64[0:1]
+type boolptr	intptr[0:1]
+
+type filename string[filename]
+```
+
+## Type Templates
+
+**Note: type templates are experimental, can have error handling bugs and are subject to change**
+
+Type templates can be declared as follows:
+
+```
+type buffer[DIR] ptr[DIR, array[int8]]
+type fileoff[BASE] BASE
+type nlattr[TYPE, PAYLOAD] {
+	nla_len		len[parent, int16]
+	nla_type	const[TYPE, int16]
+	payload		PAYLOAD
+} [align_4]
+```
+
+and later used as follows:
+
+```
+syscall(a buffer[in], b fileoff[int64], c ptr[in, nlattr[FOO, int32]])
+```
+
 ## Length
 
-You can specify length of a particular field in struct or a named argument by using `len` and `bytesize` types, for example:
+You can specify length of a particular field in struct or a named argument by using `len`, `bytesize` and `bitsize` types, for example:
 
 ```
 write(fd fd, buf buffer[in], count len[buf]) len[buf]
